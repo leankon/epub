@@ -79,8 +79,11 @@ class BuildResult:
     expected_images: int
 
 
+XML_INVALID = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f\ufffe\uffff]")
+
+
 def _esc(s: str) -> str:
-    return html.escape(s, quote=True)
+    return html.escape(XML_INVALID.sub(" ", s), quote=True)
 
 
 def region_text(r: dict[str, Any]) -> str:
@@ -93,6 +96,14 @@ def _snippet(text: str) -> str:
     return " ".join(words[:6])
 
 
+def is_cover_page(p: dict[str, Any], page_total: int) -> bool:
+    """A first page that is essentially one picture (little real text) is used as the book cover."""
+    cls = p.get("classification") or {}
+    text_chars = sum(len(region_text(r)) for r in p.get("regions") or [] if r.get("role") not in ("figure", "table"))
+    return page_total > 1 and p.get("status") == "done" and cls.get("image_coverage", 0) >= 0.6 \
+        and cls.get("chars", 0) < 200 and text_chars < 200 and bool(p.get("page_asset"))
+
+
 def collect_blocks(pages: list[dict[str, Any]], strategy: str,
                    report: dict[str, Any]) -> tuple[list[Block], list[Block]]:
     """Flatten pages into a block stream; returns (flow blocks, footnotes)."""
@@ -102,6 +113,9 @@ def collect_blocks(pages: list[dict[str, Any]], strategy: str,
         pi = p["page_index"]
         regions = sorted(p.get("regions") or [], key=lambda r: r.get("order", 0))
         cls = p.get("classification") or {}
+        if pi == 0 and is_cover_page(p, len(pages)):
+            report["cover_asset"] = p.get("page_asset")
+            continue
         page_fallback = p.get("status") != "done" or (
             strategy == "hybrid" and cls.get("fallback_recommended") and not p.get("reviewed"))
         if page_fallback:
@@ -141,7 +155,13 @@ def collect_blocks(pages: list[dict[str, Any]], strategy: str,
                     continue  # rendered inside its <figure>
                 blocks.append(Block("caption", pi, text, region_id=r["id"]))
             elif role == "heading":
-                blocks.append(Block("heading", pi, text, level=r.get("heading_level") or 2, region_id=r["id"]))
+                level = r.get("heading_level") or 2
+                prev = blocks[-1] if blocks else None
+                if prev is not None and prev.kind == "heading" and prev.page == pi and prev.level == level \
+                        and text.startswith("(") and len(prev.text) + len(text) < 80:  # "ENERO" + "(VERANO)"
+                    prev.text = f"{prev.text} {text}"
+                    continue
+                blocks.append(Block("heading", pi, text, level=level, region_id=r["id"]))
             elif role == "footnote":
                 notes.append(Block("para", pi, text, region_id=r["id"]))
                 report["footnotes"] += 1
@@ -180,10 +200,18 @@ def split_chapters(blocks: list[Block], notes: list[Block], user_chapters: list[
                 chapters.append(current)
             current.blocks.append(b)
     else:
-        levels = {b.level for b in blocks if b.kind == "heading"}
-        split_level = min(levels) if levels else None
+        counts: dict[int, int] = {}
         for b in blocks:
-            if b.kind == "heading" and b.level == split_level and (not chapters or chapters[-1].blocks):
+            if b.kind == "heading":
+                counts[b.level] = counts.get(b.level, 0) + 1
+        levels = sorted(counts)
+        split_level = levels[0] if levels else None
+        if len(levels) > 1 and counts[levels[0]] < 3 and counts[levels[1]] >= 3:
+            split_level = levels[1]  # e.g. a single large "PROLOGUE" heading above many chapter headings
+        for b in blocks:
+            # Headings at (or above) the split level start a new chapter.
+            if b.kind == "heading" and split_level is not None and b.level <= split_level \
+                    and (not chapters or chapters[-1].blocks):
                 chapters.append(Chapter(b.text[:120], start_page=b.page))
             elif not chapters:
                 chapters.append(Chapter("Start", start_page=b.page))
@@ -318,6 +346,18 @@ def build_epub(*, pages: list[dict[str, Any]], session_dir: Path, out: Path, met
         if strategy == "reflowable" and report["fallback_pages"]:
             report["warnings"].append("Some pages failed analysis and were kept as images.")
         chaps = split_chapters(blocks, notes, chapters, len(pages))
+        if report.get("cover_asset"):
+            src = (session_dir / report["cover_asset"]).resolve()
+            if session_dir.resolve() in src.parents and src.is_file():
+                name = f"images/cover{src.suffix.lower()}"
+                book.set_cover(name, src.read_bytes(), create_page=False)  # image + cover-image metadata
+                page = epub.EpubItem(uid="coverpage", file_name="text/cover.xhtml", media_type="application/xhtml+xml",
+                                     content=_xhtml(title, lang, f'<section epub:type="cover"><img src="../{name}" '
+                                                    f'alt="{_esc(title)}" style="max-width:100%;max-height:100vh"/>'
+                                                    "</section>", css="../style/book.css"))
+                book.add_item(page)
+                spine.insert(0, page)  # linear page, so readers and EPUBCheck can reach it
+                report["cover"] = True
         for k, ch in enumerate(chaps, start=1):
             body = []
             last_page = -1

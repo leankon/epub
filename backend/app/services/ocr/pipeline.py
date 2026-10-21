@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import re
 import statistics
 import uuid
 from datetime import UTC, datetime
@@ -30,6 +31,8 @@ from app.services.render import _pdfium_lock, render_bgr
 log = logging.getLogger("pdfws.ocr")
 
 LOW_CONF = 70.0
+WS_RE = re.compile(r"[\x00-\x1f\x7f \u00a0\u2000-\u200b]+")
+PAR_END_RE = re.compile(r"[.!?:»”\"…)]$")
 REVIEW_DPI_DIGITAL = 200
 
 
@@ -155,25 +158,39 @@ def analyze_digital(path: Path, page_index: int, sdir: Path, cls: dict[str, Any]
                                 laparams=LAParams(line_margin=0.5, boxes_flow=0.5)))
     lw, lh = layout.width, layout.height
     sx, sy = iw / lw, ih / lh
-    block = 0
+    boxes: list[list[tuple[str, float, tuple[float, float, float, float]]]] = []
     for el in layout:
         if not isinstance(el, LTTextBox):
             continue
-        block += 1
-        ln_no = 0
+        lines = []
         for line in el:
             if not isinstance(line, LTTextLine):
                 continue
-            text = line.get_text().strip()
+            text = WS_RE.sub(" ", line.get_text()).strip()  # PDFs often encode word gaps as tabs
             if not text:
                 continue
-            ln_no += 1
             sizes = [c.size for c in line if isinstance(c, LTChar)]
-            size = statistics.median(sizes) if sizes else line.height
-            x0, y0, x1, y1 = line.bbox
+            lines.append((text, statistics.median(sizes) if sizes else line.height, line.bbox))
+        if lines:
+            boxes.append(lines)
+    # Body-text left margin of the page: the most common line start.
+    starts = [round(b[0]) for lines in boxes for _, _, b in lines]
+    margin = max(set(starts), key=starts.count) if starts else 0.0
+    for block, lines in enumerate(boxes, start=1):
+        right = max(b[2] for _, _, b in lines)
+        par = 0
+        for ln_no, (text, size, (x0, _y0, x1, y1)) in enumerate(lines, start=1):
+            if ln_no > 1:
+                prev_text, _, prev_box = lines[ln_no - 2]
+                ended = bool(PAR_END_RE.search(prev_text))
+                indented = x0 - margin > 0.8 * size  # first-line indent starts a new paragraph
+                prev_short = prev_box[2] < right - 2.5 * size and ended
+                dialogue = ended and text[:1] in "—«\"“"
+                if indented or prev_short or dialogue:
+                    par += 1
             top = (lh - y1) * sy
             words.append(Word(text, 100.0, int(x0 * sx), int(top), int(x1 * sx), int(top + size * sy),
-                              block, 0, ln_no))
+                              block, par, ln_no))
 
     # Embedded images (extracted natively) and vector drawings (rendered crops).
     visual: list[dict[str, Any]] = []

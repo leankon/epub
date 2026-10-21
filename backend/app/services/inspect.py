@@ -80,7 +80,8 @@ def inspect_pdf(path: Path, password: str | None = None) -> dict[str, Any]:
         docinfo = pdf.docinfo if pdf.trailer.get("/Info") is not None else {}
         meta: dict[str, Any] = {}
         try:
-            with pdf.open_metadata(set_pikepdf_as_editor=False) as xmp:
+            # Read-only: update_docinfo=False, otherwise an empty XMP packet would wipe the Info values.
+            with pdf.open_metadata(set_pikepdf_as_editor=False, update_docinfo=False) as xmp:
                 meta["xmp_language"] = _s(xmp.get("dc:language"))
         except Exception:
             pass

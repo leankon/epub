@@ -176,3 +176,52 @@ def test_office_document_converts_to_pdf(fx, tmp):
     assert res["warnings"]
     assert fx["docx"].exists()  # original untouched
     shutil.rmtree(tmp / "w", ignore_errors=True)
+
+
+def test_novel_structure_chapters_cover_and_clean_text(tmp):
+    """Regression for a real ebook-to-PDF novel: same-size all-caps chapter names, bookmarks, image
+    cover, tab-encoded word gaps and a hanging last word."""
+    from app.services.handlers import _pdf_book_metadata, outline_chapters
+    from tests.fixtures import novel_pdf
+
+    for with_bm, expected in ((True, ["1. Axel", "2. Leah", "3. Axel"]),
+                              (False, ["ENERO (VERANO)", "AXEL", "LEAH", "FEBRERO (VERANO)", "AXEL"])):
+        pdf = novel_pdf(tmp / f"novel-{with_bm}.pdf", with_bookmarks=with_bm)
+        pages = analyse(pdf, tmp / str(with_bm))
+        assert pages[0]["mode"] == "ocr"  # the image-only cover page
+        res = build_epub(pages=pages, session_dir=tmp / str(with_bm) / "sess", out=tmp / f"n{with_bm}.epub",
+                         meta={"title": "T", "language": "es"}, chapters=outline_chapters(pdf))
+        assert [c["title"] for c in res.report["chapters"]] == expected
+        assert res.report.get("cover") is True
+        rep = validate_epub(res.path, expect_text=True, expected_images=res.expected_images,
+                            expected_order=res.expected_order)
+        assert rep.passed, (rep.errors, rep.epubcheck)
+        with zipfile.ZipFile(res.path) as z:
+            body = " ".join(z.read(n).decode() for n in z.namelist() if n.startswith("EPUB/text/chapter"))
+        assert "\t" not in body and "\x00" not in body
+        assert "se echó a reír." in body  # hanging word stays in its sentence, not a "marginal note"
+        assert 'class="marginal"' not in body
+    assert _pdf_book_metadata(pdf) == {"title": "Novela de Prueba", "author": "Autora Sintética"}
+
+
+def test_indented_paragraphs_become_separate_epub_paragraphs(tmp):
+    from reportlab.pdfgen import canvas
+
+    src = tmp / "indent.pdf"
+    c = canvas.Canvas(str(src), pagesize=(420, 595))
+    c.setFont("Helvetica", 11)
+    lines = [(64, "Primer párrafo que empieza con sangría y sigue"), (50, "en una segunda línea completa hasta el"),
+             (50, "final del párrafo."), (64, "Segundo párrafo con su propia sangría y"), (50, "más texto aquí."),
+             (64, "—Una línea de diálogo."), (64, "—Y la respuesta.")]
+    for k, (x, ln) in enumerate(lines):
+        c.drawString(x, 500 - 14 * k, ln)
+    c.showPage()
+    c.save()
+    pages = analyse(src, tmp)
+    res = build_epub(pages=pages, session_dir=tmp / "sess", out=tmp / "i.epub", meta={"title": "T", "language": "es"})
+    with zipfile.ZipFile(res.path) as z:
+        xhtml = z.read("EPUB/text/chapter001.xhtml").decode()
+    paras = [re.sub(r"<[^>]+>", "", p) for p in re.findall(r"<p[^>]*>.*?</p>", xhtml, re.S)]
+    assert paras == ["Primer párrafo que empieza con sangría y sigue en una segunda línea completa hasta el final "
+                     "del párrafo.", "Segundo párrafo con su propia sangría y más texto aquí.",
+                     "—Una línea de diálogo.", "—Y la respuesta."], paras

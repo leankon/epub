@@ -34,6 +34,7 @@ CHAPTER_RE = re.compile(r"^\s*(cap[íi]tulo|chapter|parte|part|libro|book|pr[óo
 PAGENUM_RE = re.compile(r"^[\W_]*(\d{1,4}|[ivxlcdm]{1,7})[\W_]*$", re.IGNORECASE)
 LIST_RE = re.compile(r"^\s*([•·▪‣◦\-–—*]|\(?\d{1,2}[.)]|\(?[a-z][.)])\s+", re.IGNORECASE)
 FOOTNOTE_RE = re.compile(r"^\s*(\d{1,3}|[*†‡§¹²³⁴⁵⁶⁷⁸⁹⁰]+)[\s.)]")
+CAPS_HEADING_RE = re.compile(r"^[A-ZÁÉÍÓÚÜÑÇÀÈÌÒÙ0-9(][A-ZÁÉÍÓÚÜÑÇÀÈÌÒÙ0-9 .,:'()\-–]{0,39}$")
 MATH_CHARS = set("=+−×÷∑∫√^<>±≤≥∞πθλμσ∂∆∇≈≠∈∀∃→⇒")
 
 
@@ -304,7 +305,10 @@ def _assign_role(r: Region, body_h: float, w: int, h: int, figures: list[Region]
     if CHAPTER_RE.match(text) and n_words <= 10 and len(r.lines) <= 2:
         r.role, r.heading_level = "heading", 1
         return
-    if (x1 - x0) < 0.2 * w and ((x1 < 0.16 * w) or (x0 > 0.84 * w)):
+    if len(r.lines) <= 2 and n_words <= 5 and CAPS_HEADING_RE.match(text) and sum(c.isalpha() for c in text) >= 2:
+        r.role, r.heading_level = "heading", 2  # e.g. "AXEL", "ENERO", "(VERANO)" in novels
+        return
+    if (x1 - x0) < 0.2 * w and ((x1 < 0.16 * w) or (x0 > 0.84 * w)) and len(text) >= 20:
         r.role = "marginal"
         return
     if body_h and y0 > 0.65 * h and r.font_size < 0.86 * body_h and FOOTNOTE_RE.match(text):

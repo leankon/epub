@@ -275,3 +275,59 @@ def write_all(d: Path) -> dict[str, Path]:
 if __name__ == "__main__":
     for k, v in write_all(Path(sys.argv[1] if len(sys.argv) > 1 else "fixtures-out")).items():
         print(f"{k}: {v}")
+
+
+def novel_pdf(out: Path, *, with_bookmarks: bool = True) -> Path:
+    """Digital novel like a typical ebook-to-PDF export: image cover, all-caps chapter names in body size,
+    month part titles, indented paragraphs, dialogue, tab-separated words and a hanging last word."""
+    from reportlab.pdfbase import pdfmetrics
+    from reportlab.pdfbase.ttfonts import TTFont
+
+    serif = "Helvetica"
+    for cand in FONT_CANDIDATES:
+        if Path(cand).exists():
+            pdfmetrics.registerFont(TTFont("FxSerif", cand))
+            serif = "FxSerif"
+            break
+    c = canvas.Canvas(str(out), pagesize=(420, 595))
+    c.setTitle("Novela de Prueba")
+    c.setAuthor("Autora Sintética")
+    cover = illustration(840, 1190)
+    c.drawImage(ImageReader(cover), 0, 0, 420, 595)
+    c.showPage()
+
+    def para_lines(c: canvas.Canvas, y: float, lines: list[str], indent: bool = True) -> float:
+        for k, ln in enumerate(lines):
+            t = c.beginText(50 + (14 if indent and k == 0 else 0), y)
+            t.setFont(serif, 11)
+            for word_i, w in enumerate(ln.split(" ")):
+                if word_i:
+                    t.textOut("\t")  # word gaps encoded as tabs, as in many exported PDFs
+                t.textOut(w)
+            c.drawText(t)
+            y -= 15
+        return y
+
+    chapters = [("ENERO", "(VERANO)", "AXEL"), (None, None, "LEAH"), ("FEBRERO", "(VERANO)", "AXEL")]
+    for n, (month, season, name) in enumerate(chapters, start=1):
+        y = 520
+        c.setFont(serif, 11)
+        if month:
+            c.drawCentredString(210, y, month)
+            c.drawCentredString(210, y - 15, season or "")
+            y -= 50
+        c.drawCentredString(210, y, name)
+        if with_bookmarks:
+            key = f"c{n}"
+            c.bookmarkPage(key)
+            c.addOutlineEntry(f"{n}. {name.capitalize()}", key, level=0)
+        y -= 40
+        y = para_lines(c, y, ["Era el capítulo número " + str(n) + " y la casa estaba en", "silencio desde hacía horas."])
+        y = para_lines(c, y, ["—¿Vienes? —preguntó ella, y él se echó a"])
+        c.setFont(serif, 11)
+        c.drawString(50, y, "reír.")
+        y -= 15
+        y = para_lines(c, y, ["El mar golpeaba las rocas con una fuerza que", "nadie recordaba."])
+        c.showPage()
+    c.save()
+    return out

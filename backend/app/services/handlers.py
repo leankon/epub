@@ -4,6 +4,7 @@ them with `ctx.add_output`; the job manager validates and registers them atomica
 from __future__ import annotations
 
 import json
+import re
 import uuid
 from datetime import UTC, datetime
 from pathlib import Path
@@ -272,6 +273,55 @@ def _language_code(langs: str) -> str:
                                                                                                           first[:2])
 
 
+def pretty_title(name: str) -> str:
+    """'911139982-1-Todo-Lo-Que-Nunca-Fuimos' -> 'Todo Lo Que Nunca Fuimos'."""
+    t = re.sub(r"^[\d\s_\-.]+", "", name or "")
+    t = re.sub(r"[_\-]+", " ", t).strip()
+    return t or name or "Untitled"
+
+
+def _pdf_book_metadata(path: Path) -> dict[str, str]:
+    """Title/author from the PDF's own metadata, when present and meaningful."""
+    from app.services.inspect import inspect_pdf
+
+    try:
+        info = inspect_pdf(path)
+    except Exception:
+        return {}
+    out: dict[str, str] = {}
+    title = (info.get("title") or "").strip()
+    if title and not re.match(r"(?i)^(untitled|microsoft word|document\d*|\S+\.(docx?|pdf|indd))", title):
+        out["title"] = title
+    author = (info.get("author") or "").strip()
+    if author and author.lower() not in ("unknown", "admin", "user"):
+        out["author"] = author
+    return out
+
+
+def outline_chapters(path: Path) -> list[dict[str, Any]] | None:
+    """Chapter boundaries from the PDF bookmarks (all levels; entries on the same page are combined)."""
+    try:
+        nodes = pdf_ops.get_outline(path)
+    except Exception:
+        return None
+    flat: list[tuple[int, str]] = []
+
+    def walk(items: list[dict[str, Any]]) -> None:
+        for it in items:
+            if it.get("page") is not None and str(it.get("title") or "").strip():
+                flat.append((int(it["page"]), re.sub(r"\s+", " ", str(it["title"])).strip()[:200]))
+            walk(it.get("children") or [])
+
+    walk(nodes)
+    if len(flat) < 3:
+        return None
+    by_page: dict[int, list[str]] = {}
+    for page, title in sorted(flat, key=lambda t: t[0]):
+        if title not in by_page.setdefault(page, []):
+            by_page[page].append(title)
+    return [{"title": " · ".join(titles), "page": page + 1} for page, titles in sorted(by_page.items())]
+
+
 def load_session_pages(sid: uuid.UUID, pdf_path: Path, sdir: Path) -> list[dict[str, Any]]:
     from app.services.render import render_pil
 
@@ -315,8 +365,12 @@ def h_pdf_to_epub(ctx: JobContext) -> None:
                      operation="ocr_analyze", input_sha256=ctx.input.sha256)
         run_session(ctx, sid, None, False)
     strategy = str(ctx.params.get("strategy", "hybrid"))
-    meta = {"title": title, "language": _language_code(langs), **book_meta, **(ctx.params.get("metadata") or {})}
-    chapters = ctx.params.get("chapters") or book_meta.get("chapters") or None
+    pdf_meta = _pdf_book_metadata(ctx.input.path)
+    meta = {"title": pretty_title(title), "language": _language_code(langs), **pdf_meta, **book_meta,
+            **(ctx.params.get("metadata") or {})}
+    chapters = ctx.params.get("chapters") or book_meta.get("chapters") or outline_chapters(ctx.input.path)
+    if chapters and not (ctx.params.get("chapters") or book_meta.get("chapters")):
+        ctx.result["chapters_from"] = "pdf_bookmarks"
     sdir = session_dir(sid)
     ctx.stage("building EPUB")
     pages = load_session_pages(sid, ctx.input.path, sdir)

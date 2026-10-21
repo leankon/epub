@@ -8,8 +8,10 @@ Strategies:
 
 from __future__ import annotations
 
+import difflib
 import html
 import re
+import unicodedata
 import uuid
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
@@ -123,6 +125,44 @@ def continues(prev: str, nxt: str) -> bool:
     return len(prev) >= 60 and unfinished and not new_dialogue_turn
 
 
+def _line_key(text: str) -> str:
+    t = unicodedata.normalize("NFKD", text.lower())
+    return re.sub(r"[^a-z]", "", t)  # drop digits (page numbers), accents, spacing and punctuation
+
+
+def repeated_lines(pages: list[dict[str, Any]]) -> set[str]:
+    """Region ids of short lines repeated on many pages (running headers/footers the geometry missed).
+
+    Keys ignore numbers and punctuation and are matched fuzzily, so OCR variants of
+    "www.example.com - Página 9" are grouped together."""
+    if len(pages) < 4:
+        return set()
+    exact: dict[str, tuple[set[int], list[str]]] = {}
+    for p in pages:
+        for r in p.get("regions") or []:
+            text = region_text(r)
+            if r.get("role") in ("heading", "figure", "table", "formula") or not text or len(text) > 80:
+                continue
+            key = _line_key(text)
+            if len(key) >= 4:
+                pgs, ids = exact.setdefault(key, (set(), []))
+                pgs.add(p["page_index"])
+                ids.append(r["id"])
+    threshold = max(4, int(0.3 * len(pages)))
+    # Fuzzy-merge OCR variants into the few keys that already repeat a lot (cheap: few seeds).
+    seeds = [k for k, (pgs, _) in exact.items() if len(pgs) >= max(3, threshold // 3)]
+    merged = {k: (set(exact[k][0]), list(exact[k][1])) for k in seeds}
+    for key, (pgs, ids) in exact.items():
+        if key in merged:
+            continue
+        for seed in seeds:
+            if abs(len(seed) - len(key)) <= 3 and difflib.SequenceMatcher(None, seed, key).ratio() >= 0.85:
+                merged[seed][0].update(pgs)
+                merged[seed][1].extend(ids)
+                break
+    return {rid for pgs, ids in merged.values() if len(pgs) >= threshold for rid in ids}
+
+
 def is_cover_page(p: dict[str, Any], page_total: int) -> bool:
     """A first page that is essentially one picture (little real text) is used as the book cover."""
     cls = p.get("classification") or {}
@@ -136,6 +176,7 @@ def collect_blocks(pages: list[dict[str, Any]], strategy: str,
     """Flatten pages into a block stream; returns (flow blocks, footnotes)."""
     blocks: list[Block] = []
     notes: list[Block] = []
+    repeated = repeated_lines(pages)
     for p in pages:
         pi = p["page_index"]
         regions = sorted(p.get("regions") or [], key=lambda r: r.get("order", 0))
@@ -161,6 +202,10 @@ def collect_blocks(pages: list[dict[str, Any]], strategy: str,
                 continue
             if role in SKIP_ROLES:
                 report["removed_running_elements"][role] = report["removed_running_elements"].get(role, 0) + 1
+                continue
+            if r["id"] in repeated:  # e.g. "www.example.com - Página 9" on every page
+                report["removed_running_elements"]["repeated"] = \
+                    report["removed_running_elements"].get("repeated", 0) + 1
                 continue
             text = region_text(r)
             if role in ("figure", "table", "formula"):

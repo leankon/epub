@@ -331,3 +331,22 @@ def novel_pdf(out: Path, *, with_bookmarks: bool = True) -> Path:
         c.showPage()
     c.save()
     return out
+
+
+def scanned_book_with_footer(out: Path, pages: int = 6, dpi: int = 200) -> Path:
+    """Scanned pages with a site footer ("www.lectulandia.com - Página N") printed above the bottom margin."""
+    imgs = []
+    body = font(int(dpi * 0.13))
+    for n in range(1, pages + 1):
+        w, h = int(8.27 * dpi), int(11.69 * dpi)
+        img = Image.new("RGB", (w, h), (250, 248, 242))
+        d = ImageDraw.Draw(img)
+        y = int(h * 0.1)
+        for ln in SPANISH + ENGLISH:
+            d.text((int(w * 0.12), y), f"{ln}", font=body, fill=(25, 25, 25))
+            y += int(dpi * 0.22)
+        d.text((int(w * 0.12), y), f"Fin del texto de la página {n}.", font=body, fill=(25, 25, 25))
+        d.text((int(w * 0.3), int(h * 0.86)), f"www.lectulandia.com - Página {n + 8}", font=font(int(dpi * 0.1)),
+               fill=(60, 60, 60))
+        imgs.append(img)
+    return image_pdf(imgs, out, dpi=dpi)

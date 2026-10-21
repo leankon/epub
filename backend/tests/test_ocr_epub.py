@@ -259,3 +259,19 @@ def test_builder_structure_rules_from_real_novel():
     assert "—Bien, gracias." in texts and "—Nada." in texts  # new dialogue turns stay separate
     assert not continues("Primeros capítulos", "Fragmentos de próximas publicaciones")  # short list items
     assert not continues("100", "Era el penúltimo sábado")
+
+
+@needs_tesseract
+def test_repeated_site_footer_is_removed_from_scanned_book(tmp):
+    from tests.fixtures import scanned_book_with_footer
+
+    pdf = scanned_book_with_footer(tmp / "footer.pdf")
+    pages = analyse(pdf, tmp)
+    assert any("lectulandia" in r["text"] for p in pages for r in p["regions"])  # it is recognised...
+    res = build_epub(pages=pages, session_dir=tmp / "sess", out=tmp / "f.epub", meta={"title": "T", "language": "es"})
+    with zipfile.ZipFile(res.path) as z:
+        body = " ".join(z.read(n).decode() for n in z.namelist() if n.startswith("EPUB/text/chapter"))
+    assert "lectulandia" not in body and "Página 9" not in body  # ...but kept out of the book text
+    assert "Fin del texto de la p" in body and "gina 6." in body  # body text kept (OCR may drop the accent)
+    removed = res.report["removed_running_elements"]
+    assert removed.get("repeated", 0) + removed.get("footer", 0) >= 6

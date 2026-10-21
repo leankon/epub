@@ -1,0 +1,25 @@
+[project]
+name = "pdfws-backend"
+version = "1.0.0"
+description = "Local-first PDF workstation backend (FastAPI)"
+requires-python = ">=3.12,<3.13"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP", "S"]
+ignore = ["B008", "S110", "S112", "S101", "S603", "S607", "S108", "S311", "B904"]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["S", "E501"]
+"app/services/office.py" = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-ra"
+markers = [
+  "e2e: end-to-end workflow through the HTTP API",
+  "slow: OCR-heavy tests",
+]

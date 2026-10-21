@@ -1,0 +1,23 @@
+# Direct dependencies (unpinned intent). requirements.txt holds the pinned lock.
+fastapi
+uvicorn[standard]
+pydantic-settings
+python-multipart
+sqlalchemy
+psycopg[binary]
+alembic
+pikepdf
+pypdfium2
+pdfminer.six
+pillow
+opencv-python-headless
+numpy
+pytesseract
+ebooklib
+lxml
+reportlab
+img2pdf
+weasyprint
+pytest
+httpx
+ruff

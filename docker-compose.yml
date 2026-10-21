@@ -1,0 +1,24 @@
+# Optional: PostgreSQL in Docker (set PDFWS_PG_MODE=docker in .env).
+# The default native mode runs a private cluster in data/postgres instead.
+services:
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PDFWS_DB_OWNER_ROLE:-pdfws_owner}
+      POSTGRES_PASSWORD: ${POSTGRES_OWNER_PASSWORD:?set in .env}
+      POSTGRES_DB: ${PDFWS_DB_NAME:-pdfws}
+      PDFWS_DB_APP_ROLE: ${PDFWS_DB_APP_ROLE:-pdfws_app}
+      POSTGRES_APP_PASSWORD: ${POSTGRES_APP_PASSWORD:?set in .env}
+    ports:
+      - "127.0.0.1:${PDFWS_PG_PORT:-54329}:5432"   # loopback only
+    volumes:
+      - pdfws-pg:/var/lib/postgresql/data
+      - ./scripts/postgres-init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+volumes:
+  pdfws-pg:

@@ -1,0 +1,178 @@
+"""OCR, layout and EPUB unit tests (local Tesseract; skipped only when it is not installed)."""
+
+from __future__ import annotations
+
+import difflib
+import re
+import shutil
+import zipfile
+from pathlib import Path
+
+import pytest
+
+from app.core.tools import tool_available
+from app.services.epub.builder import build_epub
+from app.services.epub.validate import validate_epub
+from app.services.ocr.pipeline import analyze_page
+from app.services.redact import extract_all_text
+from tests.fixtures import ENGLISH_TEXT, SPANISH_TEXT, image_pdf, scanned_page_image
+
+needs_tesseract = pytest.mark.skipif(not tool_available("tesseract"),
+                                     reason="Tesseract with spa+eng language data is not installed")
+
+# Documented tolerance: >= 95% character similarity on clean synthetic scans.
+OCR_TOLERANCE = 0.95
+
+
+def similarity(a: str, b: str) -> float:
+    norm = lambda s: re.sub(r"\s+", " ", s).strip()  # noqa: E731
+    return difflib.SequenceMatcher(None, norm(a), norm(b)).ratio()
+
+
+def analyse(pdf: Path, tmp: Path) -> list[dict]:
+    from app.services.render import page_count
+
+    out = []
+    for i in range(page_count(pdf)):
+        r = analyze_page(pdf, i, tmp / "sess", {}, tmp / "work")
+        r.update(page_index=i, status="done", reviewed=False, page_asset=r["processed_image"])
+        out.append(r)
+    return out
+
+
+def flow_text(page: dict) -> str:
+    return " ".join(r["text"] for r in sorted(page["regions"], key=lambda r: r["order"])
+                    if r["role"] in ("paragraph", "heading", "caption"))
+
+
+@needs_tesseract
+def test_ocr_recognises_spanish_and_english_within_tolerance(fx, tmp):
+    page = analyse(fx["scanned"], tmp)[0]
+    text = flow_text(page)
+    assert page["mode"] == "ocr" and page["classification"]["kind"] == "scanned"
+    es = text[text.index("El viejo"): text.index("océano") + len("océano.")]
+    en = text[text.index("The lighthouse"):]
+    assert similarity(es, SPANISH_TEXT) >= OCR_TOLERANCE, es
+    assert similarity(en[: len(ENGLISH_TEXT)], ENGLISH_TEXT) >= OCR_TOLERANCE, en
+    for word in ("señora", "Núñez", "lámpara", "océano"):  # accents and ñ preserved
+        assert word in text
+    assert page["mean_confidence"] > 80
+
+
+@needs_tesseract
+def test_layout_separates_illustration_and_caption(fx, tmp):
+    regions = analyse(fx["scanned"], tmp)[0]["regions"]
+    figs = [r for r in regions if r["role"] == "figure"]
+    assert len(figs) == 1 and figs[0]["figure"]["kind"] == "photo"
+    assert (tmp / "sess" / figs[0]["figure"]["asset"]).exists()
+    cap = next(r for r in regions if r["role"] == "caption")
+    assert cap["caption_for"] == figs[0]["id"] and cap["text"].startswith("Figura 1")
+    headings = [r for r in regions if r["role"] == "heading"]
+    assert headings and headings[0]["text"] == "Capítulo 1" and headings[0]["heading_level"] == 1
+    assert not any("faro" in (r.get("text") or "") and r["role"] == "figure" for r in regions)
+
+
+@needs_tesseract
+def test_photographed_page_is_corrected_and_recognised(fx, tmp):
+    page = analyse(fx["photographed"], tmp)[0]
+    assert page["preprocessing"].get("perspective_corrected")
+    assert similarity(flow_text(page)[:60], (" ".join(["Capítulo 1", SPANISH_TEXT]))[:60]) > 0.9
+
+
+def test_two_columns_are_not_interleaved(fx, tmp):
+    page = analyse(fx["two_column"], tmp)[0]
+    text = flow_text(page)
+    assert text.index("Left column line 15") < text.index("Right column line 1 ")
+    assert page["mode"] == "text_layer"  # good digital text is not re-OCR'd
+
+
+@needs_tesseract
+def test_searchable_pdf_output_is_selectable_text(tmp):
+    from app.services.ocr.searchable import make_searchable
+
+    src = image_pdf([scanned_page_image(300)], tmp / "scan.pdf")
+    assert "faro" not in extract_all_text(src)  # image only
+    res = make_searchable(src, tmp / "s.pdf", tmp / "w")
+    assert res["pages_ocr"] == 1
+    text = extract_all_text(tmp / "s.pdf")
+    assert "faro" in text and "lighthouse" in text
+
+
+@needs_tesseract
+def test_image_assets_survive_hybrid_conversion(fx, tmp):
+    pages = analyse(fx["scanned"], tmp)
+    res = build_epub(pages=pages, session_dir=tmp / "sess", out=tmp / "b.epub",
+                     meta={"title": "T", "language": "es"}, strategy="hybrid")
+    with zipfile.ZipFile(res.path) as z:
+        imgs = [n for n in z.namelist() if n.startswith("EPUB/images/")]
+        assert len(imgs) == 1 and z.getinfo(imgs[0]).file_size > 50_000  # full-resolution colour crop
+        chapter = z.read("EPUB/text/chapter001.xhtml").decode()
+    assert f'src="../{imgs[0][5:]}"' in chapter
+    assert "lámpara" in chapter and "<h1" in chapter
+    rep = validate_epub(res.path, expect_text=True, expected_images=1, expected_order=res.expected_order)
+    assert rep.passed, rep.errors
+
+
+def test_reflowable_and_fixed_strategies_validate(fx, tmp):
+    pages = analyse(fx["text_image"], tmp)
+    for strategy in ("reflowable", "fixed"):
+        res = build_epub(pages=pages, session_dir=tmp / "sess", out=tmp / f"{strategy}.epub",
+                         meta={"title": "T", "language": "en"}, strategy=strategy)
+        rep = validate_epub(res.path, expect_text=True, expected_images=res.expected_images,
+                            expected_order=res.expected_order)
+        assert rep.passed, (strategy, rep.errors, rep.epubcheck)
+
+
+def _rewrite_zip(src: Path, dst: Path, drop: str | None = None, patch: tuple[str, bytes, bytes] | None = None) -> None:
+    with zipfile.ZipFile(src) as zin, zipfile.ZipFile(dst, "w") as zout:
+        for info in zin.infolist():
+            if info.filename == drop:
+                continue
+            data = zin.read(info.filename)
+            if patch and info.filename == patch[0]:
+                data = data.replace(patch[1], patch[2])
+            zout.writestr(info, data)
+
+
+def test_epub_validation_detects_missing_resources_and_broken_links(fx, tmp):
+    good = fx["epub"]
+    assert validate_epub(good, run_epubcheck=False).passed
+    _rewrite_zip(good, tmp / "missing.epub", drop="EPUB/images/faro.png")
+    rep = validate_epub(tmp / "missing.epub", run_epubcheck=False)
+    assert not rep.passed
+    assert any(c.name == "manifest_resources" and not c.passed for c in rep.checks)
+    assert any(c.name == "internal_links" and not c.passed for c in rep.checks)
+    _rewrite_zip(good, tmp / "broken.epub", patch=("EPUB/c2.xhtml", b"<p>La", b'<p><a href="nowhere.xhtml">x</a>La'))
+    rep = validate_epub(tmp / "broken.epub", run_epubcheck=False)
+    assert any(c.name == "internal_links" and not c.passed for c in rep.checks)
+
+
+def test_epubcheck_runs_when_installed(fx):
+    rep = validate_epub(fx["epub"])
+    if not tool_available("epubcheck"):
+        assert rep.epubcheck["executed"] is False  # never claims EPUBCheck validation it did not run
+        pytest.skip("EPUBCheck not installed (./scripts/install-epubcheck.sh)")
+    assert rep.epubcheck["executed"] and rep.epubcheck["errors"] == 0
+
+
+def test_epub_to_pdf_keeps_text_images_and_headings(fx, tmp):
+    from app.services.epub.to_pdf import epub_to_pdf
+    from app.services.pdf_ops import get_outline
+
+    res = epub_to_pdf(fx["epub"], tmp / "b.pdf", tmp / "w")
+    text = extract_all_text(tmp / "b.pdf")
+    assert "Había una vez un faro" in text and "señora Núñez" in text
+    assert res["images"] == 1
+    assert "Capítulo 2" in [o["title"] for o in get_outline(tmp / "b.pdf")]
+
+
+@pytest.mark.skipif(not tool_available("libreoffice"), reason="LibreOffice is not installed")
+def test_office_document_converts_to_pdf(fx, tmp):
+    from app.services.office import office_to_pdf
+
+    (tmp / "w").mkdir()
+    res = office_to_pdf(fx["docx"], "docx", tmp / "o.pdf", tmp / "w")
+    assert "canción, niño, acción" in extract_all_text(tmp / "o.pdf")
+    assert res["warnings"]
+    assert fx["docx"].exists()  # original untouched
+    shutil.rmtree(tmp / "w", ignore_errors=True)

@@ -225,3 +225,37 @@ def test_indented_paragraphs_become_separate_epub_paragraphs(tmp):
     assert paras == ["Primer párrafo que empieza con sangría y sigue en una segunda línea completa hasta el final "
                      "del párrafo.", "Segundo párrafo con su propia sangría y más texto aquí.",
                      "—Una línea de diálogo.", "—Y la respuesta."], paras
+
+
+def _page(i: int, regions: list[tuple[str, str]]) -> dict:
+    return {"page_index": i, "status": "done", "reviewed": False, "classification": {"needs_ocr": False},
+            "regions": [{"id": f"p{i}-r{k}", "role": role, "order": k, "text": text, "corrected_text": None,
+                         "excluded": False, "heading_level": 2 if role == "heading" else None, "conf": 100,
+                         "source": "text_layer", "bbox": [0, 0, 1, 1], "lines": []}
+                        for k, (role, text) in enumerate(regions)]}
+
+
+def test_builder_structure_rules_from_real_novel():
+    from app.services.epub.builder import collect_blocks, continues, split_chapters
+
+    pages = [
+        _page(0, [("heading", "ÍNDICE"), ("heading", "ENERO (VERANO)"), ("paragraph", "1. Axel 2. Axel 3. Leah")]),
+        _page(1, [("heading", "ENERO")]),
+        _page(2, [("heading", "(VERANO)")]),
+        _page(3, [("paragraph", "1"), ("heading", "AXEL"),
+                  ("paragraph", "—Genial. Liberador. —Expulsé el humo—. ¿Cómo van las cosas por"),
+                  ("paragraph", "Sídney?"), ("paragraph", "—Bien, gracias."),
+                  ("paragraph", "Algo dijo antes de callarse al ver mi expresión, que era seria y muy"),
+                  ("paragraph", "—. ¿Qué ocurre?"), ("paragraph", "—Nada.")]),
+    ]
+    report = {"fallback_pages": [], "fallback_regions": [], "images_retained": 0, "removed_running_elements": {},
+              "excluded_by_user": 0, "footnotes": 0, "warnings": []}
+    blocks, notes = collect_blocks(pages, "hybrid", report)
+    chapters = split_chapters(blocks, notes, None, len(pages))
+    assert [c.title for c in chapters] == ["ÍNDICE", "ENERO (VERANO)", "1. AXEL"]
+    texts = [b.text for b in chapters[2].blocks]
+    assert "—Genial. Liberador. —Expulsé el humo—. ¿Cómo van las cosas por Sídney?" in texts
+    assert "Algo dijo antes de callarse al ver mi expresión, que era seria y muy—. ¿Qué ocurre?" in texts
+    assert "—Bien, gracias." in texts and "—Nada." in texts  # new dialogue turns stay separate
+    assert not continues("Primeros capítulos", "Fragmentos de próximas publicaciones")  # short list items
+    assert not continues("100", "Era el penúltimo sábado")

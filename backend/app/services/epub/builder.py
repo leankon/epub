@@ -96,6 +96,33 @@ def _snippet(text: str) -> str:
     return " ".join(words[:6])
 
 
+TOC_TITLE_RE = re.compile(r"(?i)^\s*(índice|indice|contenido|contenidos|sumario|contents|table of contents|index)\s*$")
+CHAPTER_NUM_RE = re.compile(r"\d{1,3}\.?|[IVXLC]{1,7}\.?")
+TOC_ENTRY_RE = re.compile(r"(?:^|\s)\d{1,3}\.\s+\S")
+
+
+def is_contents_page(regions: list[dict[str, Any]]) -> bool:
+    """A table-of-contents page: titled "Índice"/"Contents", or dense with numbered entries."""
+    texts = [region_text(r) for r in regions]
+    if any(TOC_TITLE_RE.match(t) for t in texts):
+        return True
+    entries = sum(len(TOC_ENTRY_RE.findall(t)) for t in texts)
+    return entries >= 8
+
+
+def continues(prev: str, nxt: str) -> bool:
+    """Is `nxt` the rest of a sentence that a page/column/block break split off from `prev`?"""
+    if not nxt or END_PUNCT.search(prev) or re.fullmatch(r"\d+", prev.strip()):
+        return False
+    if nxt[:1].islower() or nxt[:2] in ("—.", "—,", "—;", "—:"):
+        return True
+    # A long running sentence cut mid-way ("…¿Cómo van las cosas por" + "Sídney?"). Short unterminated
+    # lines are usually list or title-page items, so they are left alone.
+    unfinished = prev.endswith((",", ";")) or prev[-1:].isalpha()
+    new_dialogue_turn = nxt[:1] == "—" and nxt[1:2].isalpha() or nxt[:2] == "—¿" or nxt[:2] == "—¡"
+    return len(prev) >= 60 and unfinished and not new_dialogue_turn
+
+
 def is_cover_page(p: dict[str, Any], page_total: int) -> bool:
     """A first page that is essentially one picture (little real text) is used as the book cover."""
     cls = p.get("classification") or {}
@@ -113,6 +140,7 @@ def collect_blocks(pages: list[dict[str, Any]], strategy: str,
         pi = p["page_index"]
         regions = sorted(p.get("regions") or [], key=lambda r: r.get("order", 0))
         cls = p.get("classification") or {}
+        toc_page = is_contents_page(regions)
         if pi == 0 and is_cover_page(p, len(pages)):
             report["cover_asset"] = p.get("page_asset")
             continue
@@ -154,13 +182,18 @@ def collect_blocks(pages: list[dict[str, Any]], strategy: str,
                 if r.get("caption_for") in by_id and not by_id[r["caption_for"]].get("excluded"):
                     continue  # rendered inside its <figure>
                 blocks.append(Block("caption", pi, text, region_id=r["id"]))
+            elif role == "heading" and toc_page and not TOC_TITLE_RE.match(text):
+                blocks.append(Block("para", pi, text, region_id=r["id"]))  # entries listed in a contents page
             elif role == "heading":
                 level = r.get("heading_level") or 2
                 prev = blocks[-1] if blocks else None
-                if prev is not None and prev.kind == "heading" and prev.page == pi and prev.level == level \
+                if prev is not None and prev.kind == "heading" and pi - prev.page <= 1 \
                         and text.startswith("(") and len(prev.text) + len(text) < 80:  # "ENERO" + "(VERANO)"
                     prev.text = f"{prev.text} {text}"
                     continue
+                if prev is not None and prev.kind == "para" and prev.page == pi and CHAPTER_NUM_RE.fullmatch(prev.text):
+                    blocks.pop()  # a bare chapter number printed above the title: "1" + "AXEL" -> "1. AXEL"
+                    text = f"{prev.text.rstrip('.')}. {text}"
                 blocks.append(Block("heading", pi, text, level=level, region_id=r["id"]))
             elif role == "footnote":
                 notes.append(Block("para", pi, text, region_id=r["id"]))
@@ -171,10 +204,11 @@ def collect_blocks(pages: list[dict[str, Any]], strategy: str,
                 kind = "list" if role == "list_item" else "para"
                 prev = blocks[-1] if blocks else None
                 # Continue a paragraph split by a page or column break.
-                if (kind == "para" and prev is not None and prev.kind == "para" and not END_PUNCT.search(prev.text)
-                        and text[:1].islower()):
+                if kind == "para" and prev is not None and prev.kind == "para" and continues(prev.text, text):
                     if prev.text.endswith("-") and prev.text[-2:-1].isalpha():
                         prev.text = prev.text[:-1] + text
+                    elif text[:2] in ("—.", "—,", "—;", "—:"):  # narrator tag closing: "expresión—. ¿Qué…"
+                        prev.text = prev.text + text
                     else:
                         prev.text = f"{prev.text} {text}"
                     continue
